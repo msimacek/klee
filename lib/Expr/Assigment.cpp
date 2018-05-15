@@ -47,7 +47,7 @@ void MapArrayModel::toCompact(CompactArrayModel& model) const {
   for (const auto item : content) {
     unsigned difference = item.first - cursor;
     if (shouldSkip(difference)) {
-      model.skipRanges.push_back(std::make_pair(cursor, difference));
+      model.skipRanges.push_back({cursor, difference});
     } else {
       model.values.resize(model.values.size() + difference);
     }
@@ -56,11 +56,105 @@ void MapArrayModel::toCompact(CompactArrayModel& model) const {
   }
 }
 
+size_t MapArrayModel::toCompactMemory(void *mem, size_t limit) const {
+  unsigned skipRangeCount = 0;
+  unsigned valueCount = 0;
+  unsigned cursor = 0;
+  // first compute the counts
+  for (const auto item : content) {
+    unsigned difference = item.first - cursor;
+    if (shouldSkip(difference)) {
+      skipRangeCount++;
+    } else {
+      valueCount += difference;
+    }
+    valueCount++;
+    cursor = item.first + 1;
+  }
+  size_t size = 2 * sizeof(unsigned) // sizes
+      + skipRangeCount * sizeof(SkipRange) // skipRanges
+      + valueCount * sizeof(uint64_t); // values
+  if (size >= limit)
+    return 0; // above limit, won't fit
+  // now construct the values
+  unsigned *header = (unsigned*)mem;
+  header[0] = skipRangeCount;
+  header[1] = valueCount;
+  SkipRange *skipRanges = (SkipRange*)(header + 2);
+  uint64_t *values = (uint64_t*)(skipRanges + skipRangeCount);
+  cursor = 0;
+  for (const auto item : content) {
+    unsigned difference = item.first - cursor;
+    if (shouldSkip(difference)) {
+      *(skipRanges++) = {cursor, difference};
+    } else {
+      for (unsigned i = 0; i < difference; i++)
+        *(values++) = 0;
+    }
+    *(values++) = item.second;
+    cursor = item.first + 1;
+  }
+  return size;
+  }
+
+  size_t Assignment::toMemory(const map_bindings_ty& bindings, void* mem,
+                              size_t limit) {
+    size_t size = sizeof(unsigned);
+    if (size >= limit)
+      return 0; // won't fit
+    unsigned *arrayCount = (unsigned*)mem;
+    *arrayCount = bindings.size();
+    mem = arrayCount + 1;
+    for (const auto binding : bindings) {
+      size += sizeof(const Array*);
+      if (size >= limit)
+        return 0;
+      const Array **arrayHeader = (const Array**)mem;
+      *arrayHeader = binding.first;
+      mem = arrayHeader + 1;
+      size_t modelSize = binding.second.toCompactMemory(mem, limit - size);
+      if (modelSize == 0)
+        return 0;
+      size += modelSize;
+      mem = (char*)mem + modelSize;
+    }
+    return size;
+  }
+
+  Assignment::Assignment(void *mem) {
+    unsigned *arrayCount = (unsigned*)mem;
+    mem = arrayCount + 1;
+    for (unsigned i = 0; i < *arrayCount; i++) {
+      Array **arrayHeader = (Array**)mem;
+      mem = arrayHeader + 1;
+      CompactArrayModel &model = bindings[*arrayHeader];
+      size_t modelSize = model.fromMemory(mem);
+      mem = (char*)mem + modelSize;
+    }
+  }
+
+
+size_t CompactArrayModel::fromMemory(void *mem) {
+  unsigned *header = (unsigned*)mem;
+  unsigned skipRangeCount = header[0];
+  unsigned valueCount = header[1];
+  SkipRange *skipRanges = (SkipRange*)(header + 2);
+  uint64_t *values = (uint64_t*)(skipRanges + skipRangeCount);
+  this->skipRanges.reserve(skipRangeCount);
+  this->values.reserve(valueCount);
+  for (unsigned i = 0; i < skipRangeCount; i++)
+    this->skipRanges.push_back(skipRanges[i]);
+  for (unsigned i = 0; i < valueCount; i++)
+    this->values.push_back(values[i]);
+  return 2 * sizeof(unsigned) + skipRangeCount * sizeof(SkipRange)
+      + valueCount * sizeof(uint64_t);
+}
+
 uint8_t CompactArrayModel::get(unsigned index) const {
   unsigned skipTotal = 0;
-  for (const auto item : skipRanges) {
-    unsigned skipStart = item.first;
-    unsigned skipCount = item.second;
+  for (const SkipRange item : skipRanges) {
+    unsigned skipStart = item.start;
+    unsigned skipCount = item.length;
     unsigned skipEnd = skipStart + skipCount;
     if (index < skipEnd) {
       if (index >= skipStart) {
@@ -81,11 +175,11 @@ std::map<uint32_t, uint8_t> CompactArrayModel::asMap() const {
   std::map<uint32_t, uint8_t> retMap;
   unsigned index = 0;
   unsigned cursor = 0;
-  for (const auto item : skipRanges) {
-    for (; index < item.first; index++, cursor++) {
+  for (const SkipRange item : skipRanges) {
+    for (; index < item.start; index++, cursor++) {
       retMap[index] = values[cursor];
     }
-    index += item.second;
+    index += item.length;
   }
   for (; cursor < values.size(); cursor++, index++) {
     retMap[index] = values[cursor];
@@ -97,12 +191,12 @@ std::vector<uint8_t> CompactArrayModel::asVector() const {
   std::vector<uint8_t> result;
   unsigned index = 0;
   unsigned cursor = 0;
-  for (const auto item : skipRanges) {
-    for (; index < item.first; index++, cursor++) {
+  for (const SkipRange item : skipRanges) {
+    for (; index < item.start; index++, cursor++) {
       result.push_back(values[cursor]);
     }
-    index += item.second;
-    result.resize(result.size() + item.second);
+    index += item.length;
+    result.resize(result.size() + item.length);
   }
   for (; cursor < values.size(); cursor++, index++) {
     result.push_back(values[cursor]);

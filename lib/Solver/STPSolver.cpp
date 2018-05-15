@@ -78,9 +78,8 @@ public:
 
   bool computeTruth(const Query &, bool &isValid);
   bool computeValue(const Query &, ref<Expr> &result);
-  bool computeInitialValues(const Query &,
-                            const std::vector<const Array *> &objects,
-                            std::vector<std::vector<unsigned char> > &values,
+  bool computeInitialValues(const Query &query,
+                            std::shared_ptr<const Assignment> &result,
                             bool &hasSolution);
   SolverRunStatus getOperationStatusCode();
 };
@@ -148,11 +147,10 @@ char *STPSolverImpl::getConstraintLog(const Query &query) {
 }
 
 bool STPSolverImpl::computeTruth(const Query &query, bool &isValid) {
-  std::vector<const Array *> objects;
-  std::vector<std::vector<unsigned char> > values;
+  std::shared_ptr<const Assignment> result;
   bool hasSolution;
 
-  if (!computeInitialValues(query, objects, values, hasSolution))
+  if (!computeInitialValues(query, result, hasSolution))
     return false;
 
   isValid = !hasSolution;
@@ -160,50 +158,40 @@ bool STPSolverImpl::computeTruth(const Query &query, bool &isValid) {
 }
 
 bool STPSolverImpl::computeValue(const Query &query, ref<Expr> &result) {
-  std::vector<const Array *> objects;
-  std::vector<std::vector<unsigned char> > values;
+  std::shared_ptr<const Assignment> assignment;
   bool hasSolution;
 
-  // Find the object used in the expression, and compute an assignment
-  // for them.
-  findSymbolicObjects(query.expr, objects);
-  if (!computeInitialValues(query.withFalse(), objects, values, hasSolution))
+  if (!computeInitialValues(query.withFalse(), assignment, hasSolution))
     return false;
   assert(hasSolution && "state has invalid constraint set");
 
   // Evaluate the expression with the computed assignment.
-  Assignment a(objects, values);
-  result = a.evaluate(query.expr);
+  result = assignment->evaluate(query.expr);
 
   return true;
 }
 
 static SolverImpl::SolverRunStatus
 runAndGetCex(::VC vc, STPBuilder *builder, ::VCExpr q,
-             const std::vector<const Array *> &objects,
-             std::vector<std::vector<unsigned char> > &values,
+             const std::vector<ref<ReadExpr> > &reads,
+             std::shared_ptr<const Assignment>& result,
              bool &hasSolution) {
   // XXX I want to be able to timeout here, safely
   hasSolution = !vc_query(vc, q);
 
   if (hasSolution) {
-    values.reserve(objects.size());
-    for (std::vector<const Array *>::const_iterator it = objects.begin(),
-                                                    ie = objects.end();
-         it != ie; ++it) {
-      const Array *array = *it;
-      std::vector<unsigned char> data;
-
-      data.reserve(array->size);
-      for (unsigned offset = 0; offset < array->size; offset++) {
-        ExprHandle counter =
-            vc_getCounterExample(vc, builder->getInitialRead(array, offset));
-        unsigned char val = getBVUnsigned(counter);
-        data.push_back(val);
-      }
-
-      values.push_back(data);
+    Assignment::map_bindings_ty bindings;
+    for (ref<ReadExpr> read : reads) {
+      const Array *array = read->updates.root;
+      ExprHandle indexExpr =
+          vc_getCounterExample(vc, builder->construct(read->index));
+      unsigned index = getBVUnsigned(indexExpr);
+      ExprHandle valueExpr =
+          vc_getCounterExample(vc, builder->getInitialRead(array, index));
+      unsigned value = getBVUnsigned(valueExpr);
+      bindings[read->updates.root].add(index, value);
     }
+    result = std::make_shared<Assignment>(bindings);
   }
 
   if (true == hasSolution) {
@@ -217,18 +205,9 @@ static void stpTimeoutHandler(int x) { _exit(52); }
 
 static SolverImpl::SolverRunStatus
 runAndGetCexForked(::VC vc, STPBuilder *builder, ::VCExpr q,
-                   const std::vector<const Array *> &objects,
-                   std::vector<std::vector<unsigned char> > &values,
+                   const std::vector<ref<ReadExpr> > &reads,
+                   std::shared_ptr<const Assignment>& result,
                    bool &hasSolution, double timeout) {
-  unsigned char *pos = shared_memory_ptr;
-  unsigned sum = 0;
-  for (std::vector<const Array *>::const_iterator it = objects.begin(),
-                                                  ie = objects.end();
-       it != ie; ++it)
-    sum += (*it)->size;
-  if (sum >= shared_memory_size)
-    llvm::report_fatal_error("not enough shared memory for counterexample");
-
   fflush(stdout);
   fflush(stderr);
   int pid = fork();
@@ -247,16 +226,20 @@ runAndGetCexForked(::VC vc, STPBuilder *builder, ::VCExpr q,
     }
     unsigned res = vc_query(vc, q);
     if (!res) {
-      for (std::vector<const Array *>::const_iterator it = objects.begin(),
-                                                      ie = objects.end();
-           it != ie; ++it) {
-        const Array *array = *it;
-        for (unsigned offset = 0; offset < array->size; offset++) {
-          ExprHandle counter =
-              vc_getCounterExample(vc, builder->getInitialRead(array, offset));
-          *pos++ = getBVUnsigned(counter);
-        }
+      Assignment::map_bindings_ty bindings;
+      for (ref<ReadExpr> read : reads) {
+        const Array *array = read->updates.root;
+        ExprHandle indexExpr =
+            vc_getCounterExample(vc, builder->construct(read->index));
+        unsigned index = getBVUnsigned(indexExpr);
+        ExprHandle valueExpr =
+            vc_getCounterExample(vc, builder->getInitialRead(array, index));
+        unsigned value = getBVUnsigned(valueExpr);
+        bindings[read->updates.root].add(index, value);
       }
+      size_t size = Assignment::toMemory(bindings, shared_memory_ptr, shared_memory_size);
+      if (size == 0)
+        llvm::report_fatal_error("not enough shared memory for counterexample");
     }
     _exit(res);
   } else {
@@ -303,16 +286,7 @@ runAndGetCexForked(::VC vc, STPBuilder *builder, ::VCExpr q,
     }
 
     if (hasSolution) {
-      values = std::vector<std::vector<unsigned char> >(objects.size());
-      unsigned i = 0;
-      for (std::vector<const Array *>::const_iterator it = objects.begin(),
-                                                      ie = objects.end();
-           it != ie; ++it) {
-        const Array *array = *it;
-        std::vector<unsigned char> &data = values[i++];
-        data.insert(data.begin(), pos, pos + array->size);
-        pos += array->size;
-      }
+      result = std::make_shared<Assignment>(shared_memory_ptr);
     }
 
     if (true == hasSolution) {
@@ -323,8 +297,8 @@ runAndGetCexForked(::VC vc, STPBuilder *builder, ::VCExpr q,
   }
 }
 bool STPSolverImpl::computeInitialValues(
-    const Query &query, const std::vector<const Array *> &objects,
-    std::vector<std::vector<unsigned char> > &values, bool &hasSolution) {
+    const Query &query, std::shared_ptr<const Assignment>& result,
+    bool &hasSolution) {
   runStatusCode = SOLVER_RUN_STATUS_FAILURE;
 
   TimerStatIncrementer t(stats::queryTime);
@@ -348,15 +322,19 @@ bool STPSolverImpl::computeInitialValues(
     klee_warning("STP query:\n%.*s\n", (unsigned)len, buf);
   }
 
+  std::vector<ref<ReadExpr> > reads;
+  findReads(query.expr, true, reads);
+  for (const auto constraint: query.constraints)
+    findReads(constraint, true, reads);
   bool success;
   if (useForkedSTP) {
-    runStatusCode = runAndGetCexForked(vc, builder, stp_e, objects, values,
+    runStatusCode = runAndGetCexForked(vc, builder, stp_e, reads, result,
                                        hasSolution, timeout);
     success = ((SOLVER_RUN_STATUS_SUCCESS_SOLVABLE == runStatusCode) ||
                (SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE == runStatusCode));
   } else {
     runStatusCode =
-        runAndGetCex(vc, builder, stp_e, objects, values, hasSolution);
+        runAndGetCex(vc, builder, stp_e, reads, result, hasSolution);
     success = true;
   }
 

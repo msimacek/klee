@@ -19,9 +19,14 @@
 namespace klee {
   class Array;
 
+  struct SkipRange {
+    uint32_t start;
+    uint32_t length;
+  };
+
   class CompactArrayModel {
   private:
-    std::vector<std::pair<uint32_t, uint32_t> > skipRanges;
+    std::vector<SkipRange> skipRanges;
     std::vector<uint8_t> values;
     friend class MapArrayModel;
   public:
@@ -29,6 +34,7 @@ namespace klee {
     std::map<uint32_t, uint8_t> asMap() const;
     std::vector<uint8_t> asVector() const;
     void dump() const;
+    size_t fromMemory(void *mem);
   };
 
   class MapArrayModel {
@@ -65,6 +71,7 @@ namespace klee {
     }
 
     void toCompact(CompactArrayModel& model) const;
+    size_t toCompactMemory(void *mem, size_t limit) const;
   };
 
   class VectorAssignment {
@@ -104,8 +111,9 @@ namespace klee {
     bindings_ty bindings;
 
   public:
-    Assignment(const bindings_ty bindings) : bindings(bindings) {}
-    Assignment(const map_bindings_ty models) {
+    Assignment(const bindings_ty &bindings) : bindings(bindings) {}
+    explicit Assignment(void *mem);
+    Assignment(const map_bindings_ty &models) {
       for (const auto &pair : models) {
         auto &item = bindings[pair.first];
         pair.second.toCompact(item);
@@ -120,6 +128,8 @@ namespace klee {
     template<typename InputIterator>
     bool satisfies(InputIterator begin, InputIterator end) const;
     void dump() const;
+    static size_t toMemory(const map_bindings_ty &bindings, void *mem,
+                           size_t limit);
   };
 
   template <typename T>
