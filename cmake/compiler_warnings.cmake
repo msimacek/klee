@@ -16,15 +16,11 @@
 set(GCC_AND_CLANG_WARNINGS_CXX
   "-Wall"
   "-Wextra"
-  "-Wno-unused-parameter"
-  "-Wno-implicit-fallthrough"
-)
+  "-Wno-unused-parameter")
 set(GCC_AND_CLANG_WARNINGS_C
   "-Wall"
   "-Wextra"
-  "-Wno-unused-parameter"
-  "-Wno-implicit-fallthrough"
-)
+  "-Wno-unused-parameter")
 set(GCC_ONLY_WARNINGS_C "")
 set(GCC_ONLY_WARNINGS_CXX "")
 set(CLANG_ONLY_WARNINGS_C "")
